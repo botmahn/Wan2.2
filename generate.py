@@ -3,6 +3,7 @@ import argparse
 import logging
 import os
 import sys
+import time
 import warnings
 from datetime import datetime
 
@@ -76,7 +77,18 @@ def _validate_args(args):
         args.tts_prompt_text = EXAMPLE_PROMPT[args.task]["tts_prompt_text"]
         args.tts_text = EXAMPLE_PROMPT[args.task]["tts_text"]
 
-    if args.task == "i2v-A14B":
+    args.batch_mode = args.image_dir is not None and args.caption_dir is not None
+    if args.batch_mode:
+        assert args.task == "i2v-A14B", \
+            "Batch mode (--image_dir / --caption_dir) currently only supports --task i2v-A14B."
+        assert os.path.isdir(args.image_dir), \
+            f"--image_dir does not exist: {args.image_dir}"
+        assert os.path.isdir(args.caption_dir), \
+            f"--caption_dir does not exist: {args.caption_dir}"
+        assert args.save_file is None, \
+            "--save_file is ignored in batch mode; use --save_dir instead."
+
+    if args.task == "i2v-A14B" and not args.batch_mode:
         assert args.image is not None, "Please specify the image path for i2v."
 
     cfg = WAN_CONFIGS[args.task]
@@ -199,6 +211,24 @@ def _parse_args():
         default=None,
         help="The image to generate the video from.")
     parser.add_argument(
+        "--image_dir",
+        type=str,
+        default=None,
+        help="Folder of images for batch I2V. Pair with --caption_dir containing matching <basename>.txt files."
+    )
+    parser.add_argument(
+        "--caption_dir",
+        type=str,
+        default=None,
+        help="Folder of .txt caption files whose basenames match images in --image_dir."
+    )
+    parser.add_argument(
+        "--save_dir",
+        type=str,
+        default=None,
+        help="Output folder for generated videos in batch mode. Defaults to 'outputs/'."
+    )
+    parser.add_argument(
         "--sample_solver",
         type=str,
         default='unipc',
@@ -300,6 +330,29 @@ def _parse_args():
     return args
 
 
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
+
+
+def _gather_batch_pairs(image_dir, caption_dir):
+    """Return sorted list of (image_path, caption_text) for matching basenames."""
+    pairs = []
+    for fname in sorted(os.listdir(image_dir)):
+        stem, ext = os.path.splitext(fname)
+        if ext.lower() not in IMAGE_EXTS:
+            continue
+        caption_path = os.path.join(caption_dir, stem + ".txt")
+        if not os.path.isfile(caption_path):
+            logging.warning(f"No caption file for image {fname}; skipping.")
+            continue
+        with open(caption_path, "r", encoding="utf-8") as f:
+            caption = f.read().strip()
+        if not caption:
+            logging.warning(f"Empty caption for image {fname}; skipping.")
+            continue
+        pairs.append((os.path.join(image_dir, fname), caption))
+    return pairs
+
+
 def _init_logging(rank):
     # logging
     if rank == 0:
@@ -370,35 +423,36 @@ def generate(args):
         dist.broadcast_object_list(base_seed, src=0)
         args.base_seed = base_seed[0]
 
-    logging.info(f"Input prompt: {args.prompt}")
     img = None
-    if args.image is not None:
-        img = Image.open(args.image).convert("RGB")
-        logging.info(f"Input image: {args.image}")
+    if not args.batch_mode:
+        logging.info(f"Input prompt: {args.prompt}")
+        if args.image is not None:
+            img = Image.open(args.image).convert("RGB")
+            logging.info(f"Input image: {args.image}")
 
-    # prompt extend
-    if args.use_prompt_extend:
-        logging.info("Extending prompt ...")
-        if rank == 0:
-            prompt_output = prompt_expander(
-                args.prompt,
-                image=img,
-                tar_lang=args.prompt_extend_target_lang,
-                seed=args.base_seed)
-            if prompt_output.status == False:
-                logging.info(
-                    f"Extending prompt failed: {prompt_output.message}")
-                logging.info("Falling back to original prompt.")
-                input_prompt = args.prompt
+        # prompt extend (batch mode extends per-iteration inside the I2V loop)
+        if args.use_prompt_extend:
+            logging.info("Extending prompt ...")
+            if rank == 0:
+                prompt_output = prompt_expander(
+                    args.prompt,
+                    image=img,
+                    tar_lang=args.prompt_extend_target_lang,
+                    seed=args.base_seed)
+                if prompt_output.status == False:
+                    logging.info(
+                        f"Extending prompt failed: {prompt_output.message}")
+                    logging.info("Falling back to original prompt.")
+                    input_prompt = args.prompt
+                else:
+                    input_prompt = prompt_output.prompt
+                input_prompt = [input_prompt]
             else:
-                input_prompt = prompt_output.prompt
-            input_prompt = [input_prompt]
-        else:
-            input_prompt = [None]
-        if dist.is_initialized():
-            dist.broadcast_object_list(input_prompt, src=0)
-        args.prompt = input_prompt[0]
-        logging.info(f"Extended prompt: {args.prompt}")
+                input_prompt = [None]
+            if dist.is_initialized():
+                dist.broadcast_object_list(input_prompt, src=0)
+            args.prompt = input_prompt[0]
+            logging.info(f"Extended prompt: {args.prompt}")
 
     if "t2v" in args.task:
         logging.info("Creating WanT2V pipeline.")
@@ -526,18 +580,130 @@ def generate(args):
             t5_cpu=args.t5_cpu,
             convert_model_dtype=args.convert_model_dtype,
         )
-        logging.info("Generating video ...")
-        video = wan_i2v.generate(
-            args.prompt,
-            img,
-            max_area=MAX_AREA_CONFIGS[args.size],
-            frame_num=args.frame_num,
-            shift=args.sample_shift,
-            sample_solver=args.sample_solver,
-            sampling_steps=args.sample_steps,
-            guide_scale=args.sample_guide_scale,
-            seed=args.base_seed,
-            offload_model=args.offload_model)
+
+        if args.batch_mode:
+            if rank == 0:
+                pairs = _gather_batch_pairs(args.image_dir, args.caption_dir)
+                assert len(pairs) > 0, (
+                    f"No image/caption pairs found between {args.image_dir} "
+                    f"and {args.caption_dir}.")
+                logging.info(f"Batch I2V: {len(pairs)} pair(s) to process.")
+                save_dir = args.save_dir or "outputs"
+                os.makedirs(save_dir, exist_ok=True)
+            else:
+                pairs = None
+                save_dir = args.save_dir or "outputs"
+            if dist.is_initialized():
+                obj = [pairs]
+                dist.broadcast_object_list(obj, src=0)
+                pairs = obj[0]
+        else:
+            pairs = [(args.image, args.prompt)]
+            save_dir = None
+
+        if dist.is_initialized():
+            dist.barrier()
+        torch.cuda.synchronize()
+        loop_start = time.perf_counter()
+        iter_times = []
+
+        for idx, (image_path, caption) in enumerate(pairs):
+            if dist.is_initialized():
+                dist.barrier()
+            torch.cuda.synchronize()
+            iter_start = time.perf_counter()
+
+            cur_img = Image.open(image_path).convert("RGB")
+            logging.info(
+                f"[{idx + 1}/{len(pairs)}] Image: {image_path}")
+            logging.info(f"[{idx + 1}/{len(pairs)}] Prompt: {caption}")
+
+            cur_prompt = caption
+            if args.batch_mode and args.use_prompt_extend:
+                if rank == 0:
+                    prompt_output = prompt_expander(
+                        cur_prompt,
+                        image=cur_img,
+                        tar_lang=args.prompt_extend_target_lang,
+                        seed=args.base_seed)
+                    if prompt_output.status is False:
+                        logging.info(
+                            f"Extending prompt failed: {prompt_output.message}. "
+                            "Falling back to original prompt.")
+                        extended = cur_prompt
+                    else:
+                        extended = prompt_output.prompt
+                    holder = [extended]
+                else:
+                    holder = [None]
+                if dist.is_initialized():
+                    dist.broadcast_object_list(holder, src=0)
+                cur_prompt = holder[0]
+                logging.info(f"Extended prompt: {cur_prompt}")
+
+            logging.info("Generating video ...")
+            video = wan_i2v.generate(
+                cur_prompt,
+                cur_img,
+                max_area=MAX_AREA_CONFIGS[args.size],
+                frame_num=args.frame_num,
+                shift=args.sample_shift,
+                sample_solver=args.sample_solver,
+                sampling_steps=args.sample_steps,
+                guide_scale=args.sample_guide_scale,
+                seed=args.base_seed,
+                offload_model=args.offload_model)
+
+            if rank == 0:
+                if args.batch_mode:
+                    stem = os.path.splitext(os.path.basename(image_path))[0]
+                    save_file = os.path.join(save_dir, stem + ".mp4")
+                elif args.save_file is not None:
+                    save_file = args.save_file
+                else:
+                    formatted_time = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    formatted_prompt = cur_prompt.replace(" ", "_").replace(
+                        "/", "_")[:50]
+                    size_token = args.size.replace(
+                        '*', 'x') if sys.platform == 'win32' else args.size
+                    save_file = (
+                        f"{args.task}_{size_token}_{args.ulysses_size}_"
+                        f"{formatted_prompt}_{formatted_time}.mp4")
+                logging.info(f"Saving generated video to {save_file}")
+                save_video(
+                    tensor=video[None],
+                    save_file=save_file,
+                    fps=cfg.sample_fps,
+                    nrow=1,
+                    normalize=True,
+                    value_range=(-1, 1))
+            del video
+            torch.cuda.empty_cache()
+
+            if dist.is_initialized():
+                dist.barrier()
+            torch.cuda.synchronize()
+            iter_elapsed = time.perf_counter() - iter_start
+            iter_times.append(iter_elapsed)
+            logging.info(
+                f"[{idx + 1}/{len(pairs)}] Iteration wall-clock: "
+                f"{iter_elapsed:.2f}s")
+
+        total_elapsed = time.perf_counter() - loop_start
+        if iter_times:
+            avg = sum(iter_times) / len(iter_times)
+            logging.info(
+                f"Batch I2V finished: {len(iter_times)} pair(s), "
+                f"total {total_elapsed:.2f}s, avg {avg:.2f}s/pair, "
+                f"min {min(iter_times):.2f}s, max {max(iter_times):.2f}s")
+        else:
+            logging.info(f"Batch I2V finished: total {total_elapsed:.2f}s")
+
+        if dist.is_initialized():
+            dist.barrier()
+            dist.destroy_process_group()
+        logging.info("Finished.")
+        return
 
     if rank == 0:
         if args.save_file is None:
